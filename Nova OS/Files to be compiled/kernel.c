@@ -17,6 +17,13 @@ static int cursor_visible = 1;
 static char cmd_buffer[CMD_BUFFER_SIZE];
 static int cmd_index = 0;
 
+// 命令历史
+#define HISTORY_SIZE 16
+static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
+static int history_count = 0;        // 已存储的命令数
+static int history_pos = 0;          // 当前浏览位置（0 表示未浏览）
+static int history_tail = 0;         // 下一个要写入的位置
+
 //文件系统
 #define MAX_FILES 64
 #define MAX_FILENAME 32
@@ -45,7 +52,7 @@ void print(const char* str);
 void disable_hardware_cursor();
 
 //程序光标有点Bug，所以要禁用硬件光标
-// 禁用硬件光标
+//禁用硬件光标
 void disable_hardware_cursor() {
     __asm__ volatile(
         "mov $0x0A, %%al\n"
@@ -256,7 +263,7 @@ char* itoa(int num, char* buffer) {
     return buffer;
 }
 
-//路径工具函数
+// ---------- 路径工具函数 ----------
 // 复制字符串到目标（安全版）
 void strcpy_safe(char* dest, const char* src, int max_len) {
     int i = 0;
@@ -400,7 +407,18 @@ void get_current_path(char* buffer, int max_len) {
     buffer[pos] = '\0';
 }
 
-//文件系统初始化
+// ---------- 获取文件名（从路径中提取最后一个组件） ----------
+const char* get_filename_from_path(const char* path) {
+    const char* p = path;
+    const char* last = path;
+    while (*p) {
+        if (*p == '/') last = p + 1;
+        p++;
+    }
+    return last;
+}
+
+// ---------- 文件系统初始化 ----------
 void init_filesystem() {
     for (int i = 0; i < MAX_FILES; i++) {
         files[i].used = 0;
@@ -417,17 +435,6 @@ void init_filesystem() {
     files[0].size = 0;
     strcpy_safe(files[0].name, "/", MAX_FILENAME);
     current_dir = 0;
-}
-
-// ---------- 获取文件名（从路径中提取最后一个组件） ----------
-const char* get_filename_from_path(const char* path) {
-    const char* p = path;
-    const char* last = path;
-    while (*p) {
-        if (*p == '/') last = p + 1;
-        p++;
-    }
-    return last;
 }
 
 // ---------- 处理命令 ----------
@@ -720,11 +727,12 @@ static void process_command() {
         print("cat <name> - Show file content\n");
         print("write <name> <content> - Write content to file\n");
         print("rm <name> - Delete file or empty directory\n");
+        print("Tip: Use ↑/↓ to browse command history\n");
     }else if (strcmp(cmd_buffer, "reboot") == 1) {
         print("Rebooting...\n");
         __asm__ volatile("int $0x19");
     }else if (strcmp(cmd_buffer, "version") == 1) {
-        print("Nova OS Kernel v0.4 \n");
+        print("Nova OS Kernel v0.5 (History)\n");
     }else if (starts_with(cmd_buffer, "echo ")) {
         const char* args = cmd_buffer + 5;
         print(args);
@@ -809,6 +817,14 @@ static void process_command() {
         print("\n");
     }
     done:
+    // ---------- 保存命令到历史 ----------
+    if (cmd_buffer[0] != '\0') {
+        strcpy_safe(history[history_tail], cmd_buffer, CMD_BUFFER_SIZE);
+        history_tail = (history_tail + 1) % HISTORY_SIZE;
+        if (history_count < HISTORY_SIZE) history_count++;
+    }
+    history_pos = 0;  // 重置浏览位置
+
     cmd_index = 0;
     cmd_buffer[0] = '\0';
     print("> ");
@@ -958,6 +974,77 @@ void keyboard_handler_c() {
         disable_hardware_cursor();
         return;
     }
+
+    // ---------- 上箭头 (0x48) - 命令历史向上 ----------
+    if (scancode == 0x48) {
+        if (history_count > 0) {
+            // 如果当前没有浏览历史，从最新开始
+            if (history_pos == 0) {
+                history_pos = history_tail == 0 ? HISTORY_SIZE - 1 : history_tail - 1;
+                if (history_count < HISTORY_SIZE) {
+                    history_pos = history_count - 1;
+                }
+            } else {
+                int prev = (history_pos - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+                if (prev != history_tail || history_count == HISTORY_SIZE) {
+                    history_pos = prev;
+                }
+            }
+            // 回显历史命令
+            while (cmd_index > 0) {
+                backspace();
+                cmd_index--;
+            }
+            char* cmd = history[history_pos];
+            int i = 0;
+            while (cmd[i]) {
+                putchar(cmd[i]);
+                cmd_buffer[i] = cmd[i];
+                i++;
+            }
+            cmd_buffer[i] = '\0';
+            cmd_index = i;
+        }
+        __asm__ volatile("mov $0x20, %%al\n out %%al, $0x20" : : : "eax");
+        disable_hardware_cursor();
+        return;
+    }
+
+    // ---------- 下箭头 (0x50) - 命令历史向下 ----------
+    if (scancode == 0x50) {
+        if (history_pos != 0 && history_count > 0) {
+            int next = (history_pos + 1) % HISTORY_SIZE;
+            if (next != history_tail || history_count == HISTORY_SIZE) {
+                history_pos = next;
+            } else {
+                history_pos = 0;  // 退出历史模式
+            }
+            // 回显命令
+            while (cmd_index > 0) {
+                backspace();
+                cmd_index--;
+            }
+            if (history_pos != 0) {
+                char* cmd = history[history_pos];
+                int i = 0;
+                while (cmd[i]) {
+                    putchar(cmd[i]);
+                    cmd_buffer[i] = cmd[i];
+                    i++;
+                }
+                cmd_buffer[i] = '\0';
+                cmd_index = i;
+            } else {
+                cmd_buffer[0] = '\0';
+                cmd_index = 0;
+            }
+        }
+        __asm__ volatile("mov $0x20, %%al\n out %%al, $0x20" : : : "eax");
+        disable_hardware_cursor();
+        return;
+    }
+
+    // ---------- 退格 ----------
     if (scancode == 0x0E) {
         if (cmd_index > 0) {
             cmd_index--;
@@ -1047,14 +1134,13 @@ void kmain(unsigned int magic, unsigned int addr) {
     print(" | |\\  | (_) \\ V /  __/ |  | |_| |____) |\n");
     print(" |_| \\_|\\___/ \\_/ \\___|_|   \\___/|_____/ \n");
     print("\n");
-    print("           Nova OS v0.4      \n");
+    print("           Nova OS v0.5      \n");
     print("\n");
 
     init_filesystem();
-    print("Nova OS Kernel v0.4 \n");
-    print("Commands: ls, mkdir, cd, pwd, touch, cat, write, rm, cls, help, reboot, version, echo, beep(Beta), shutdown, calc\n");
+    print("Nova OS Kernel v0.5\n");
+    print("Commands: ls, mkdir, cd, pwd, touch, cat, write, rm, cls, help, reboot, version, echo, beep, shutdown, calc\n");
     print("> ");
-
     __asm__ volatile("sti");
 
     while (1) {
