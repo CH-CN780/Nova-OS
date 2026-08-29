@@ -1,6 +1,6 @@
 # Nova-OS
 从头创建一个操作系统（Nova OS）！
-Nova OS 0.5
+Nova OS 0.6
 
 完整的 Shell 环境（16 个命令）
 
