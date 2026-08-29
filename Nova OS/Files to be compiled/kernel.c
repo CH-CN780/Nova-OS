@@ -29,7 +29,24 @@ static int history_tail = 0;         // 下一个要写入的位置
 #define MAX_FILENAME 32
 #define MAX_FILE_SIZE 2048
 #define MAX_PATH 128
-
+// ---------- ATA PIO 驱动 ----------
+#define ATA_PRIMARY_IO       0x1F0
+#define ATA_PRIMARY_CTRL     0x3F6
+#define ATA_SECTOR_SIZE      512
+// ---------- FAT12 数据结构 ----------
+#define FAT12_SECTOR_SIZE    512
+#define FAT12_SECTORS_PER_CLUSTER 1
+#define FAT12_RESERVED_SECTORS 1    // 引导扇区
+#define FAT12_FAT_COUNT      2
+#define FAT12_ROOT_ENTRIES   224
+#define FAT12_MAX_FILENAME   11
+// ---------- FAT12 全局变量 ----------
+static uint8_t fat12_sector_cache[FAT12_SECTOR_SIZE];
+static uint16_t fat12_sectors_per_fat;
+static uint16_t fat12_root_dir_sector;
+static uint16_t fat12_data_sector;
+static int fat12_mounted = 0;
+static uint16_t fat12_reserved_sectors = 1;
 struct file_entry {
     char name[MAX_FILENAME];
     char data[MAX_FILE_SIZE];
@@ -77,7 +94,142 @@ void disable_hardware_cursor() {
         : : : "al", "dx", "memory"
     );
 }
+// 等待磁盘就绪
+static void ata_wait_ready() {
+    uint8_t status;
+    do {
+        __asm__ volatile(
+            "mov $0x1F7, %%dx\n"
+            "in %%dx, %%al"
+            : "=a"(status)
+            : : "dx"
+        );
+    } while (status & 0x80);
+}
+// 读取一个扇区
+void ata_read_sector(uint32_t lba, uint8_t* buffer) {
+    ata_wait_ready();
 
+    uint8_t lba_low = lba & 0xFF;
+    uint8_t lba_mid = (lba >> 8) & 0xFF;
+    uint8_t lba_high = (lba >> 16) & 0xFF;
+
+    // 选择 LBA 模式
+    __asm__ volatile("mov $0x1F6, %%dx\n mov $0xE0, %%al\n out %%al, %%dx" : : : "al", "dx");
+    // 扇区数 = 1
+    __asm__ volatile("mov $0x1F2, %%dx\n mov $0x01, %%al\n out %%al, %%dx" : : : "al", "dx");
+    // LBA 低 8 位
+    __asm__ volatile("mov $0x1F3, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_low) : "dx");
+    // LBA 中 8 位
+    __asm__ volatile("mov $0x1F4, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_mid) : "dx");
+    // LBA 高 8 位
+    __asm__ volatile("mov $0x1F5, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_high) : "dx");
+    // 读命令
+    __asm__ volatile("mov $0x1F7, %%dx\n mov $0x20, %%al\n out %%al, %%dx" : : : "al", "dx");
+
+    ata_wait_ready();
+    for (int i = 0; i < ATA_SECTOR_SIZE / 2; i++) {
+        uint16_t word;
+        __asm__ volatile(
+            "mov $0x1F0, %%dx\n"
+            "in %%dx, %%ax"
+            : "=a"(word)
+            : : "dx"
+        );
+        buffer[i*2] = word & 0xFF;
+        buffer[i*2+1] = (word >> 8) & 0xFF;
+    }
+}
+
+// 写入一个扇区
+void ata_write_sector(uint32_t lba, const uint8_t* buffer) {
+    ata_wait_ready();
+
+    uint8_t lba_low = lba & 0xFF;
+    uint8_t lba_mid = (lba >> 8) & 0xFF;
+    uint8_t lba_high = (lba >> 16) & 0xFF;
+
+    // 选择 LBA 模式
+    __asm__ volatile("mov $0x1F6, %%dx\n mov $0xE0, %%al\n out %%al, %%dx" : : : "al", "dx");
+    // 扇区数 = 1
+    __asm__ volatile("mov $0x1F2, %%dx\n mov $0x01, %%al\n out %%al, %%dx" : : : "al", "dx");
+    // LBA 低 8 位
+    __asm__ volatile("mov $0x1F3, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_low) : "dx");
+    // LBA 中 8 位
+    __asm__ volatile("mov $0x1F4, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_mid) : "dx");
+    // LBA 高 8 位
+    __asm__ volatile("mov $0x1F5, %%dx\n mov %0, %%al\n out %%al, %%dx" : : "a" (lba_high) : "dx");
+    // 写命令
+    __asm__ volatile("mov $0x1F7, %%dx\n mov $0x30, %%al\n out %%al, %%dx" : : : "al", "dx");
+
+    ata_wait_ready();  // ← 等待写入命令接受完成
+    for (int i = 0; i < ATA_SECTOR_SIZE / 2; i++) {
+        uint16_t word = buffer[i*2] | (buffer[i*2+1] << 8);
+        __asm__ volatile(
+            "mov $0x1F0, %%dx\n"
+            "mov %0, %%ax\n"
+            "out %%ax, %%dx"
+            : : "a"(word) : "dx"
+        );
+    }
+    ata_wait_ready();  // ← **关键：等待数据写入完成**
+}
+struct fat12_bpb {
+    uint8_t  jump[3];
+    uint8_t  oem[8];
+    uint16_t bytes_per_sector;
+    uint8_t  sectors_per_cluster;
+    uint16_t reserved_sectors;
+    uint8_t  fat_count;
+    uint16_t root_entries;
+    uint16_t total_sectors_16;
+    uint8_t  media_descriptor;
+    uint16_t sectors_per_fat;
+    uint16_t sectors_per_track;
+    uint16_t heads;
+    uint32_t hidden_sectors;
+    uint32_t total_sectors_32;
+    uint8_t  drive_number;
+    uint8_t  reserved;
+    uint8_t  boot_signature;
+    uint32_t volume_id;
+    uint8_t  volume_label[11];
+    uint8_t  filesystem_type[8];
+} __attribute__((packed));
+
+struct fat12_dir_entry {
+    uint8_t  name[8];
+    uint8_t  ext[3];
+    uint8_t  attributes;
+    uint8_t  reserved;
+    uint8_t  create_time_tenth;
+    uint16_t create_time;
+    uint16_t create_date;
+    uint16_t access_date;
+    uint16_t cluster_high;
+    uint16_t modify_time;
+    uint16_t modify_date;
+    uint16_t cluster_low;
+    uint32_t file_size;
+} __attribute__((packed));
+// 挂载 FAT12（从 LBA 1 开始，跳过 MBR）
+void fat12_mount() {
+    // 读取引导扇区（LBA 0）
+    uint8_t boot_sector[FAT12_SECTOR_SIZE];
+    ata_read_sector(0, boot_sector);
+    struct fat12_bpb* bpb = (struct fat12_bpb*)boot_sector;
+    // 检查 FAT12 签名
+    if (bpb->boot_signature != 0x29 || bpb->bytes_per_sector != 512) {
+        print("Not a valid FAT12 filesystem.\n");
+        return;
+    }
+    fat12_reserved_sectors = bpb->reserved_sectors;
+    fat12_sectors_per_fat = bpb->sectors_per_fat;
+    fat12_root_dir_sector = bpb->reserved_sectors + (bpb->fat_count * fat12_sectors_per_fat);
+    fat12_data_sector = fat12_root_dir_sector + (bpb->root_entries * 32 / FAT12_SECTOR_SIZE);
+    fat12_mounted = 1;
+    print("FAT12 filesystem mounted.\n");
+}
 //软件光标控制 
 void erase_cursor() {
     if (cursor_visible) {
@@ -436,26 +588,189 @@ void init_filesystem() {
     strcpy_safe(files[0].name, "/", MAX_FILENAME);
     current_dir = 0;
 }
+// ---------- FAT12 辅助函数 ----------
 
+// 读取根目录到内存（用于遍历）
+void fat12_read_root_dir(uint8_t* buffer) {
+    for (int i = 0; i < 14; i++) {
+        ata_read_sector(fat12_root_dir_sector + i, buffer + i * FAT12_SECTOR_SIZE);
+    }
+}
+
+// 写入根目录（保存修改）
+void fat12_write_root_dir(const uint8_t* buffer) {
+    for (int i = 0; i < 14; i++) {
+        ata_write_sector(fat12_root_dir_sector + i, buffer + i * FAT12_SECTOR_SIZE);
+    }
+}
+
+// 查找根目录中的文件/目录项，返回索引
+int fat12_find_entry(const char* filename, struct fat12_dir_entry* entry_out) {
+    uint8_t root_dir[FAT12_SECTOR_SIZE * 14];
+    fat12_read_root_dir(root_dir);
+    struct fat12_dir_entry* entries = (struct fat12_dir_entry*)root_dir;
+    
+    // 将文件名转换为 8.3 格式
+    char name_83[11];
+    int i, j;
+    for (i = 0; i < 11; i++) name_83[i] = ' ';
+    for (i = 0; filename[i] && i < 8; i++) {
+        if (filename[i] == '.') break;
+        name_83[i] = filename[i];
+    }
+    if (filename[i] == '.') {
+        i++;
+        for (j = 0; filename[i + j] && j < 3; j++) {
+            name_83[8 + j] = filename[i + j];
+        }
+    }
+    
+    for (int i = 0; i < FAT12_ROOT_ENTRIES; i++) {
+        if (entries[i].name[0] == 0x00) break;
+        if (entries[i].name[0] == 0xE5) continue;
+        // 比较名字（8 字节）
+        int match = 1;
+        for (int j = 0; j < 11; j++) {
+            if (entries[i].name[j] != name_83[j]) { match = 0; break; }
+        }
+        if (match) {
+            if (entry_out) *entry_out = entries[i];
+            return i;
+        }
+    }
+    return -1;
+}
+
+// 读取文件数据（根据簇链）
+void fat12_read_file(struct fat12_dir_entry* entry, uint8_t* buffer) {
+    if (entry->file_size == 0) return;
+    uint16_t cluster = entry->cluster_low;
+    int bytes_read = 0;
+    while (cluster < 0xFF8 && bytes_read < entry->file_size) {
+        uint32_t sector = fat12_data_sector + (cluster - 2) * FAT12_SECTORS_PER_CLUSTER;
+        ata_read_sector(sector, buffer + bytes_read);
+        bytes_read += FAT12_SECTOR_SIZE;
+        // 读取 FAT 表找下一个簇
+        uint8_t fat_sector[FAT12_SECTOR_SIZE];
+        uint32_t fat_offset = cluster * 3 / 2;
+        ata_read_sector(fat12_reserved_sectors + fat_offset / FAT12_SECTOR_SIZE, fat_sector);
+        uint16_t fat_entry;
+        if (cluster % 2 == 0) {
+            fat_entry = fat_sector[fat_offset % FAT12_SECTOR_SIZE] | 
+                        ((fat_sector[fat_offset % FAT12_SECTOR_SIZE + 1] & 0x0F) << 8);
+        } else {
+            fat_entry = ((fat_sector[fat_offset % FAT12_SECTOR_SIZE] & 0xF0) >> 4) |
+                        (fat_sector[fat_offset % FAT12_SECTOR_SIZE + 1] << 4);
+        }
+        cluster = fat_entry;
+    }
+}
+
+// 写入文件数据（简单实现：只支持写入第一个簇）
+void fat12_write_file(struct fat12_dir_entry* entry, const uint8_t* data, int size) {
+    if (size == 0) return;
+    uint16_t cluster = entry->cluster_low;
+    if (cluster == 0) {
+        // 分配第一个簇（从 2 开始查找）
+        cluster = 2;
+        // 更新 FAT 表标记此簇已使用
+    }
+    uint32_t sector = fat12_data_sector + (cluster - 2) * FAT12_SECTORS_PER_CLUSTER;
+    // 写入数据（补齐到 512 字节）
+    uint8_t sector_data[FAT12_SECTOR_SIZE];
+    for (int i = 0; i < FAT12_SECTOR_SIZE; i++) {
+        sector_data[i] = (i < size) ? data[i] : 0;
+    }
+    ata_write_sector(sector, sector_data);
+    entry->file_size = size;
+}
+
+// ---------- 格式化 FAT12 ----------
+void fat12_format() {
+    print("Formatting FAT12 filesystem...\n");
+    // 写入引导扇区
+    uint8_t boot_sector[FAT12_SECTOR_SIZE] = {0};
+    struct fat12_bpb* bpb = (struct fat12_bpb*)boot_sector;
+    bpb->jump[0] = 0xEB; bpb->jump[1] = 0x3C; bpb->jump[2] = 0x90;
+    bpb->oem[0] = 'M'; bpb->oem[1] = 'S'; bpb->oem[2] = 'W';
+    bpb->oem[3] = 'I'; bpb->oem[4] = 'N'; bpb->oem[5] = '4';
+    bpb->oem[6] = '.'; bpb->oem[7] = '1';
+    bpb->bytes_per_sector = 512;
+    bpb->sectors_per_cluster = 1;
+    bpb->reserved_sectors = 1;
+    bpb->fat_count = 2;
+    bpb->root_entries = 224;
+    bpb->total_sectors_16 = 65535;
+    bpb->media_descriptor = 0xF8;
+    bpb->sectors_per_fat = 9;
+    bpb->sectors_per_track = 18;
+    bpb->heads = 2;
+    bpb->hidden_sectors = 0;
+    bpb->total_sectors_32 = 0;
+    bpb->drive_number = 0x80;
+    bpb->reserved = 0;
+    bpb->boot_signature = 0x29;
+    bpb->volume_id = 0x12345678;
+    bpb->volume_label[0] = 'N'; bpb->volume_label[1] = 'O'; bpb->volume_label[2] = 'V'; bpb->volume_label[3] = 'A';
+    bpb->volume_label[4] = ' '; bpb->volume_label[5] = 'O'; bpb->volume_label[6] = 'S';
+    bpb->volume_label[7] = ' '; bpb->volume_label[8] = ' '; bpb->volume_label[9] = ' '; bpb->volume_label[10] = ' ';
+    bpb->filesystem_type[0] = 'F'; bpb->filesystem_type[1] = 'A'; bpb->filesystem_type[2] = 'T';
+    bpb->filesystem_type[3] = '1'; bpb->filesystem_type[4] = '2'; bpb->filesystem_type[5] = ' ';
+    bpb->filesystem_type[6] = ' '; bpb->filesystem_type[7] = ' ';
+    boot_sector[510] = 0x55;
+    boot_sector[511] = 0xAA;
+    ata_write_sector(0, boot_sector);
+    
+    // 清空 FAT 表（2 份）
+    uint8_t zero_sector[FAT12_SECTOR_SIZE] = {0};
+    for (int i = 0; i < 9; i++) {
+        ata_write_sector(1 + i, zero_sector);
+        ata_write_sector(1 + 9 + i, zero_sector);
+    }
+    // 标记 FAT 前两个簇为已用
+    zero_sector[0] = 0xF8; zero_sector[1] = 0xFF; zero_sector[2] = 0xFF;
+    ata_write_sector(1, zero_sector);
+    ata_write_sector(1 + 9, zero_sector);
+    
+    // 清空根目录（14 个扇区）
+    for (int i = 0; i < 14; i++) {
+        ata_write_sector(fat12_root_dir_sector + i, zero_sector);
+    }
+    fat12_reserved_sectors = 1;
+    fat12_sectors_per_fat = 9;
+    fat12_root_dir_sector = 1 + 2 * 9;  // reserved + fat_count * sectors_per_fat
+    fat12_data_sector = fat12_root_dir_sector + (224 * 32 / 512);  // root_dir + root_entries * 32 / 512
+    fat12_mounted = 1;
+
+    
+}
 // ---------- 处理命令 ----------
 static void process_command() {
     // -------- ls --------
     if (strcmp(cmd_buffer, "ls") == 1) {
+        if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
+        // 读取根目录
+        uint8_t root_dir[FAT12_SECTOR_SIZE * 14];  // 根目录最多 14 扇区（224 项 * 32 字节 / 512）
+        for (int i = 0; i < 14; i++) {
+            ata_read_sector(fat12_root_dir_sector + i, root_dir + i * FAT12_SECTOR_SIZE);
+        }
+        struct fat12_dir_entry* entry = (struct fat12_dir_entry*)root_dir;
         int count = 0;
-        for (int i = 0; i < MAX_FILES; i++) {
-            if (files[i].used && files[i].parent == current_dir) {
-                if (files[i].isdir) {
-                    print("[DIR]  ");
-                } else {
-                    print("[FILE] ");
-                }
-                print(files[i].name);
-                print("  ");
-                char buf[16];
-                print(itoa(files[i].size, buf));
-                print(" bytes\n");
-                count++;
-            }
+        for (int i = 0; i < FAT12_ROOT_ENTRIES; i++) {
+            if (entry[i].name[0] == 0x00) break;  // 结束
+            if (entry[i].name[0] == 0xE5) continue; // 删除
+            char filename[13];
+            int j;
+            for (j = 0; j < 8 && entry[i].name[j] != ' '; j++) filename[j] = entry[i].name[j];
+            filename[j] = '.';
+            for (int k = 0; k < 3 && entry[i].ext[k] != ' '; k++) filename[j+1+k] = entry[i].ext[k];
+            filename[j+1+3] = '\0';
+            print(filename);
+            print("  ");
+            char buf[16];
+            print(itoa(entry[i].file_size, buf));
+            print(" bytes\n");
+            count++;
         }
         if (count == 0) print("(empty)\n");
     }
@@ -558,153 +873,147 @@ static void process_command() {
     }
     // -------- touch --------
     else if (starts_with(cmd_buffer, "touch ")) {
+        if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
         const char* fname = cmd_buffer + 6;
         while (*fname == ' ') fname++;
-        if (*fname == '\0') {
-            print("Error: missing filename\n");
+        if (*fname == '\0') { print("Error: missing filename\n"); goto done; }
+        // 检查是否已存在
+        struct fat12_dir_entry entry;
+        if (fat12_find_entry(fname, &entry) != -1) {
+            print("File already exists.\n");
             goto done;
         }
-        // 检查是否包含路径分隔符
-        int has_slash = 0;
-        const char* p = fname;
-        while (*p) { if (*p == '/') { has_slash = 1; break; } p++; }
-        
-        if (has_slash) {
-            // 含路径：解析父目录
-            int parent;
-            int target = resolve_path(fname, &parent);
-            if (target != -1) {
-                print("Error: already exists\n");
-                goto done;
-            }
-            if (parent == -1) {
-                print("Error: parent directory not found\n");
-                goto done;
-            }
-            const char* name = get_filename_from_path(fname);
-            if (*name == '\0') {
-                print("Error: invalid name\n");
-                goto done;
-            }
-            // 创建文件，父目录为 parent
-            for (int i = 0; i < MAX_FILES; i++) {
-                if (!files[i].used) {
-                    strcpy_safe(files[i].name, name, MAX_FILENAME);
-                    files[i].used = 1;
-                    files[i].isdir = 0;
-                    files[i].parent = parent;
-                    files[i].size = 0;
-                    files[i].data[0] = '\0';
-                    print("File created.\n");
-                    break;
-                }
-            }
-        } else {
-            // 简单名称，父目录为当前目录
-            int found = find_entry(current_dir, fname);
-            if (found != -1) {
-                print("Error: already exists\n");
-                goto done;
-            }
-            for (int i = 0; i < MAX_FILES; i++) {
-                if (!files[i].used) {
-                    strcpy_safe(files[i].name, fname, MAX_FILENAME);
-                    files[i].used = 1;
-                    files[i].isdir = 0;
-                    files[i].parent = current_dir;
-                    files[i].size = 0;
-                    files[i].data[0] = '\0';
-                    print("File created.\n");
-                    break;
-                }
+        // 在根目录中创建新文件
+        uint8_t root_dir[FAT12_SECTOR_SIZE * 14];
+        fat12_read_root_dir(root_dir);
+        struct fat12_dir_entry* entries = (struct fat12_dir_entry*)root_dir;
+        int slot = -1;
+        for (int i = 0; i < FAT12_ROOT_ENTRIES; i++) {
+            if (entries[i].name[0] == 0x00 || entries[i].name[0] == 0xE5) {
+                slot = i;
+                break;
             }
         }
+        if (slot == -1) { print("Error: directory full\n"); goto done; }
+        // 初始化目录项
+        for (int i = 0; i < 11; i++) entries[slot].name[i] = ' ';
+        for (int i = 0; fname[i] && i < 8; i++) {
+            if (fname[i] == '.') break;
+            entries[slot].name[i] = fname[i];
+        }
+        int dot_pos = 0;
+        for (int i = 0; fname[i]; i++) { if (fname[i] == '.') { dot_pos = i; break; } }
+        if (dot_pos > 0) {
+            for (int i = dot_pos + 1, j = 0; fname[i] && j < 3; i++, j++) {
+                entries[slot].ext[j] = fname[i];
+            }
+        }
+        entries[slot].attributes = 0x00;
+        entries[slot].cluster_low = 0;
+        entries[slot].file_size = 0;
+        fat12_write_root_dir(root_dir);
+        print("File created.\n");
     }
     // -------- cat --------
     else if (starts_with(cmd_buffer, "cat ")) {
+        if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
         const char* fname = cmd_buffer + 4;
         while (*fname == ' ') fname++;
-        if (*fname == '\0') {
-            print("Error: missing filename\n");
-            goto done;
-        }
-        int parent;
-        int target = resolve_path(fname, &parent);
-        if (target == -1 || files[target].isdir) {
+        if (*fname == '\0') { print("Error: missing filename\n"); goto done; }
+        struct fat12_dir_entry entry;
+        if (fat12_find_entry(fname, &entry) == -1) {
             print("File not found.\n");
             goto done;
         }
-        if (files[target].size > 0) {
-            print(files[target].data);
-            print("\n");
-        }
+        if (entry.file_size == 0) { print("(empty file)\n"); goto done; }
+        uint8_t data[entry.file_size + 1];
+        fat12_read_file(&entry, data);
+        data[entry.file_size] = '\0';
+        print((char*)data);
+        print("\n");
     }
     // -------- write --------
     else if (starts_with(cmd_buffer, "write ")) {
+        if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
         const char* rest = cmd_buffer + 6;
         while (*rest == ' ') rest++;
         char fname[MAX_FILENAME];
         int i = 0;
-        while (*rest != ' ' && *rest != '\0') {
-            if (i < MAX_FILENAME-1) fname[i++] = *rest;
-            rest++;
-        }
+        while (*rest != ' ' && *rest != '\0') { fname[i++] = *rest++; }
         fname[i] = '\0';
         while (*rest == ' ') rest++;
-        if (*rest == '\0') {
-            print("Error: no content to write\n");
-            goto done;
+        if (*rest == '\0') { print("Error: no content\n"); goto done; }
+        struct fat12_dir_entry entry;
+        int idx = fat12_find_entry(fname, &entry);
+        if (idx == -1) { print("File not found.\n"); goto done; }
+        // 计算内容长度
+        int len = 0;
+        const char* p = rest;
+        while (*p++) len++;
+        if (len > 0) len--;
+        // 读取根目录
+        uint8_t root_dir[FAT12_SECTOR_SIZE * 14];
+        fat12_read_root_dir(root_dir);
+        struct fat12_dir_entry* entries = (struct fat12_dir_entry*)root_dir;
+        // 如果文件大小为 0，需要分配簇
+        if (entry.cluster_low == 0) {
+            // 简单分配簇 2（演示）
+            entries[idx].cluster_low = 2;
+            // 在 FAT 表中标记簇 2 为已用（0xFFF）
+            uint8_t fat_sector[FAT12_SECTOR_SIZE];
+            ata_read_sector(1, fat_sector);
+            fat_sector[2] = 0xFF;
+            fat_sector[3] = 0xFF;
+            ata_write_sector(1, fat_sector);
         }
-        int parent;
-        int target = resolve_path(fname, &parent);
-        if (target == -1 || files[target].isdir) {
-            print("File not found.\n");
-            goto done;
+        // 写入数据
+        uint32_t sector = fat12_data_sector + (entries[idx].cluster_low - 2) * FAT12_SECTORS_PER_CLUSTER;
+        uint8_t sector_data[FAT12_SECTOR_SIZE];
+        for (int j = 0; j < FAT12_SECTOR_SIZE; j++) {
+            sector_data[j] = (j < len) ? rest[j] : 0;
         }
-        int j = 0;
-        while (*rest && j < MAX_FILE_SIZE-1) {
-            files[target].data[j++] = *rest++;
-        }
-        files[target].data[j] = '\0';
-        files[target].size = j;
+        ata_write_sector(sector, sector_data);
+        entries[idx].file_size = len;
+        fat12_write_root_dir(root_dir);
         char buf[16];
         print("Written ");
-        print(itoa(files[target].size, buf));
+        print(itoa(len, buf));
         print(" bytes.\n");
     }
     // -------- rm --------
     else if (starts_with(cmd_buffer, "rm ")) {
+        if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
         const char* fname = cmd_buffer + 3;
         while (*fname == ' ') fname++;
-        if (*fname == '\0') {
-            print("Error: missing filename\n");
-            goto done;
+        if (*fname == '\0') { print("Error: missing filename\n"); goto done; }
+        struct fat12_dir_entry entry;
+        int idx = fat12_find_entry(fname, &entry);
+        if (idx == -1) { print("File not found.\n"); goto done; }
+        // 如果文件有簇，在 FAT 表中释放
+        if (entry.cluster_low != 0) {
+            // 简单实现：仅释放第一个簇
+            uint8_t fat_sector[FAT12_SECTOR_SIZE];
+            ata_read_sector(1, fat_sector);
+            // 标记簇为可用（0x000）
+            uint32_t offset = entry.cluster_low * 3 / 2;
+            fat_sector[offset % FAT12_SECTOR_SIZE] = 0x00;
+            fat_sector[offset % FAT12_SECTOR_SIZE + 1] = 0x00;
+            ata_write_sector(1, fat_sector);
+            // 第二份 FAT
+            ata_write_sector(1 + 9, fat_sector);
         }
-        int parent;
-        int target = resolve_path(fname, &parent);
-        if (target == -1) {
-            print("File not found.\n");
-            goto done;
-        }
-        if (files[target].isdir) {
-            // 检查目录是否为空
-            int empty = 1;
-            for (int i = 0; i < MAX_FILES; i++) {
-                if (files[i].used && files[i].parent == target) {
-                    empty = 0;
-                    break;
-                }
-            }
-            if (!empty) {
-                print("Error: directory not empty\n");
-                goto done;
-            }
-        }
-        files[target].used = 0;
-        files[target].size = 0;
-        files[target].name[0] = '\0';
-        files[target].data[0] = '\0';
+        // 标记目录项为删除
+        uint8_t root_dir[FAT12_SECTOR_SIZE * 14];
+        fat12_read_root_dir(root_dir);
+        struct fat12_dir_entry* entries = (struct fat12_dir_entry*)root_dir;
+        entries[idx].name[0] = 0xE5;
+        fat12_write_root_dir(root_dir);
         print("Deleted.\n");
+    }
+    // -------- format --------
+    else if (strcmp(cmd_buffer, "format") == 1) {
+        fat12_format();
+        print("FAT12 formatted.\n");
     }
     // -------- cls --------
     else if (strcmp(cmd_buffer, "cls") == 1) {
@@ -732,7 +1041,7 @@ static void process_command() {
         print("Rebooting...\n");
         __asm__ volatile("int $0x19");
     }else if (strcmp(cmd_buffer, "version") == 1) {
-        print("Nova OS Kernel v0.5 (History)\n");
+        print("Nova OS Kernel v0.6 (History)\n");
     }else if (starts_with(cmd_buffer, "echo ")) {
         const char* args = cmd_buffer + 5;
         print(args);
@@ -1120,6 +1429,7 @@ void setup_pic() {
 // ---------- 内核入口 ----------
 __attribute__((noreturn))
 void kmain(unsigned int magic, unsigned int addr) {
+    fat12_format();
     setup_gdt();
     setup_idt();
     setup_pic();
@@ -1134,11 +1444,9 @@ void kmain(unsigned int magic, unsigned int addr) {
     print(" | |\\  | (_) \\ V /  __/ |  | |_| |____) |\n");
     print(" |_| \\_|\\___/ \\_/ \\___|_|   \\___/|_____/ \n");
     print("\n");
-    print("           Nova OS v0.5      \n");
-    print("\n");
-
+    print("           Nova OS v0.6      \n");
+    fat12_mount();  // 尝试挂载 FAT12
     init_filesystem();
-    print("Nova OS Kernel v0.5\n");
     print("Commands: ls, mkdir, cd, pwd, touch, cat, write, rm, cls, help, reboot, version, echo, beep, shutdown, calc\n");
     print("> ");
     __asm__ volatile("sti");
