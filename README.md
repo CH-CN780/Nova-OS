@@ -11,4 +11,4 @@ Shift 键支持（大写字母 + 符号）
 可在 QEMU/VMware 中运行（iso文件）
 
 
-（用了deepseek！！！）
+（用了vscode和deepseek！！！）
