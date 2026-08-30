@@ -845,9 +845,17 @@ static void process_command() {
             char filename[13];
             int j;
             for (j = 0; j < 8 && entries[i].name[j] != ' '; j++) filename[j] = entries[i].name[j];
-            filename[j] = '.';
-            for (int k = 0; k < 3 && entries[i].ext[k] != ' '; k++) filename[j+1+k] = entries[i].ext[k];
-            filename[j+1+3] = '\0';
+            if (entries[i].attributes & 0x10) {
+                // 目录：直接结束，不加点
+                filename[j] = '\0';
+            } else {
+                // 文件：添加点+扩展名
+                filename[j] = '.';
+                for (int k = 0; k < 3 && entries[i].ext[k] != ' '; k++) {
+                    filename[j+1+k] = entries[i].ext[k];
+                }
+                filename[j+1+3] = '\0';
+            }
             print(filename);
             print("  ");
             char buf[16];
@@ -1053,13 +1061,15 @@ static void process_command() {
             goto done;
         }
         if (entry.file_size == 0) { print("(empty file)\n"); goto done; }
+        if (entry.cluster_low == 0) { print("(empty file)\n"); goto done; }
         uint8_t data[entry.file_size + 1];
-        fat12_read_file(&entry, data);
+        uint32_t sector = fat12_data_sector + (entry.cluster_low - 2) * FAT12_SECTORS_PER_CLUSTER;
+        ata_read_sector(sector, data);
         data[entry.file_size] = '\0';
         print((char*)data);
         print("\n");
     }
-    // -------- write --------
+   // -------- write --------
     else if (starts_with(cmd_buffer, "write ")) {
         if (!fat12_mounted) { print("No FAT12 filesystem.\n"); goto done; }
         const char* rest = cmd_buffer + 6;
@@ -1070,23 +1080,20 @@ static void process_command() {
         fname[i] = '\0';
         while (*rest == ' ') rest++;
         if (*rest == '\0') { print("Error: no content\n"); goto done; }
-        // 查找文件（当前目录）
         struct fat12_dir_entry entry;
         int idx = fat12_find_entry_in_dir(current_fat_cluster, fname, &entry);
         if (idx == -1) { print("File not found.\n"); goto done; }
-        // 计算内容长度
         int len = 0;
         const char* p = rest;
         while (*p++) len++;
         if (len > 0) len--;
         if (len > FAT12_SECTOR_SIZE) { print("Error: content too large (max 512 bytes)\n"); goto done; }
-        // 读取当前目录
         uint8_t* dir_buf = fat12_dir_buffer;
         fat12_read_dir(current_fat_cluster, dir_buf);
         struct fat12_dir_entry* entries = (struct fat12_dir_entry*)dir_buf;
-        // 如果文件大小为 0，分配一个簇
+
+        // 如果文件没有分配簇，分配一个
         if (entry.cluster_low == 0) {
-            // 查找空闲簇
             uint16_t new_cluster = 2;
             for (uint16_t c = 2; c < 0xFF0; c++) {
                 uint8_t fat_sector[FAT12_SECTOR_SIZE];
@@ -1105,7 +1112,7 @@ static void process_command() {
                     break;
                 }
             }
-            // 标记簇为已用
+            // 标记 FAT 表（两份）
             uint8_t fat_sector[FAT12_SECTOR_SIZE];
             ata_read_sector(1, fat_sector);
             uint32_t offset = new_cluster * 3 / 2;
@@ -1118,9 +1125,12 @@ static void process_command() {
             }
             ata_write_sector(1, fat_sector);
             ata_write_sector(1 + 9, fat_sector);
+
+            // ★★★ 关键：更新目录项的 cluster_low ★★★
             entries[idx].cluster_low = new_cluster;
         }
-        // 写入数据
+
+        // 写入数据到数据区
         uint32_t sector = fat12_data_sector + (entries[idx].cluster_low - 2) * FAT12_SECTORS_PER_CLUSTER;
         uint8_t sector_data[FAT12_SECTOR_SIZE];
         for (int j = 0; j < FAT12_SECTOR_SIZE; j++) {
@@ -1128,7 +1138,10 @@ static void process_command() {
         }
         ata_write_sector(sector, sector_data);
         entries[idx].file_size = len;
+
+        //关键：保存目录项到磁盘
         fat12_write_dir(current_fat_cluster, dir_buf);
+
         char buf[16];
         print("Written ");
         print(itoa(len, buf));
