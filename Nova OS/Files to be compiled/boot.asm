@@ -25,3 +25,10 @@ _keyboard_handler_wrapper:
     call _keyboard_handler_c
     popa
     iret
+global _mouse_handler_wrapper
+extern _mouse_handler_c
+_mouse_handler_wrapper:
+    pusha
+    call _mouse_handler_c
+    popa
+    iretd
