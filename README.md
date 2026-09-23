@@ -1,8 +1,7 @@
 # Nova-OS
 从头创建一个操作系统（Nova OS）！
-Nova OS 0.7
+Nova OS 0.
 
-完整的 Shell 环境（17 个命令）
 
 目录支持（mkdir、cd、pwd）
 鼠标
@@ -10,6 +9,7 @@ Nova OS 0.7
 命令历史（↑/↓ 方向键翻看）
 Shift 键支持（大写字母 + 符号）
 可在 QEMU/VMware 中运行（iso文件）
-
+编译C++（部分）
+Install
 
 （用了vscode和deepseek！！！）
