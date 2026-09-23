@@ -1,6 +1,6 @@
 # Nova-OS
 从头创建一个操作系统（Nova OS）！
-Nova OS 0.
+Nova OS 0.8
 
 
 目录支持（mkdir、cd、pwd）
